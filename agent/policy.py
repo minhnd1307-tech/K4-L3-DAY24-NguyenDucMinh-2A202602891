@@ -98,9 +98,10 @@ def check(context: PolicyContext) -> tuple[bool, str]:
         return False, f"deny: purpose '{context.request_purpose}' not permitted for principal '{context.principal_id}'"
 
     # 4. Tính quyền hiệu lực (giao các tập scopes)
-    effective_tools = set(principal_data.get("allowed_tools", []))
-    if context.agent_scopes:
-        effective_tools = effective_tools.intersection(context.agent_scopes)
+    if not context.agent_scopes:
+        return False, "deny: agent_scopes is required and cannot be empty"
+
+    effective_tools = set(principal_data.get("allowed_tools", [])).intersection(context.agent_scopes)
 
     # Nếu ủy quyền qua nhiều tầng (delegation_depth > 0), không được mở rộng quyền ngoài parent_scopes
     if context.delegation_depth > 0:
@@ -113,6 +114,8 @@ def check(context: PolicyContext) -> tuple[bool, str]:
                 f"deny: tool '{context.requested_tool}' not in effective tools "
                 f"{sorted(effective_tools)} for principal '{context.principal_id}'"
             )
+    else:
+        return False, "deny: requested_tool is required"
 
     return True, (
         f"allow: tool '{context.requested_tool}' permitted for principal "

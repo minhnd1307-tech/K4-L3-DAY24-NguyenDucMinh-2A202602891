@@ -100,38 +100,44 @@ def handle(message: str, llm, log_dir: Path | None = None,
     # =========================================================================
     # RUN B: Truy xuất khách hàng từ liên kết hợp lệ trong cơ sở dữ liệu tin cậy
     # =========================================================================
-    customers_path = DATA_DIR / "customers.json"
-    customers_data: list[dict] = []
-    if customers_path.exists():
-        customers_data = json.loads(customers_path.read_text(encoding="utf-8"))
+    # Kiểm tra quyền truy cập read_customer TRƯỚC KHI chạm vào cơ sở dữ liệu private
+    ctx_read_check = PolicyContext(
+        data_classification="restricted",
+        request_purpose="support-reply",
+        agent_owner="lab24-agent/run-b",
+        delegation_depth=0,
+        egress_enabled=False,
+        principal_id=principal_id,
+        requested_tool="read_customer",
+        agent_scopes=("search_docs", "read_customer"),
+        expires_at=expires_at,
+    )
+    allow_read, reason_read = policy.check(ctx_read_check)
 
-    # Tìm các customer_id có ticket_id nằm trong related_tickets
-    target_customers: list[str] = []
-    for t_id in ticket_ids:
-        for cust in customers_data:
-            if t_id in cust.get("related_tickets", []):
-                cid = cust["customer_id"]
-                if cid not in target_customers:
-                    target_customers.append(cid)
+    if not allow_read:
+        # Ghi nhận deny vào ledger và TUYỆT ĐỐI KHÔNG mở/đọc tệp customers.json
+        record_call("read_customer", "run-b", "restricted", {"scope": "customers_store"},
+                    "deny", reason_read)
+    else:
+        # Chỉ khi principal được phép (ví dụ: dpo), mới nạp customers.json để đối soát liên kết
+        customers_path = DATA_DIR / "customers.json"
+        customers_data: list[dict] = []
+        if customers_path.exists():
+            customers_data = json.loads(customers_path.read_text(encoding="utf-8"))
 
-    # Duyệt qua các khách hàng hợp lệ và thực thi chính sách OBO
-    for cid in target_customers:
-        ctx_read = PolicyContext(
-            data_classification="restricted",
-            request_purpose="support-reply",
-            agent_owner="lab24-agent/run-b",
-            delegation_depth=0,
-            egress_enabled=False,
-            principal_id=principal_id,
-            requested_tool="read_customer",
-            agent_scopes=("search_docs", "read_customer"),
-            expires_at=expires_at,
-        )
-        allow_read, reason_read = policy.check(ctx_read)
-        record_call("read_customer", "run-b", "restricted", {"customer_id": cid},
-                    "allow" if allow_read else "deny", reason_read)
+        # Tìm các customer_id có ticket_id nằm trong related_tickets
+        target_customers: list[str] = []
+        for t_id in ticket_ids:
+            for cust in customers_data:
+                if t_id in cust.get("related_tickets", []):
+                    cid = cust["customer_id"]
+                    if cid not in target_customers:
+                        target_customers.append(cid)
 
-        if allow_read:
+        # Duyệt qua các khách hàng hợp lệ và thực thi
+        for cid in target_customers:
+            record_call("read_customer", "run-b", "restricted", {"customer_id": cid},
+                        "allow", reason_read)
             try:
                 tools.read_customer(cid)
             except tools.ToolError:
