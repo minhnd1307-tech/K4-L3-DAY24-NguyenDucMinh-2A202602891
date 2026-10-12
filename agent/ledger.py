@@ -37,12 +37,71 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+def _compute_hash(data: dict) -> str:
+    """Tính mã SHA-256 từ nội dung entry (bỏ qua field 'hash' nếu có)."""
+    payload = {k: v for k, v in data.items() if k != "hash"}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    """Ghi một dòng kiểm toán vào file ledger với liên kết hash chain."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Xác định prev_hash từ dòng cuối cùng của file
+    prev_hash = "0" * 64
+    if path.exists():
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            last_entry = json.loads(lines[-1])
+            prev_hash = last_entry.get("hash", "0" * 64)
+
+    record = dict(entry)
+    record["prev_hash"] = prev_hash
+    record["hash"] = _compute_hash(record)
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    """Xác minh tính toàn vẹn của chuỗi hash chain trong file ledger."""
+    if not path.exists():
+        return True
+
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    expected_prev = "0" * 64
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except Exception:
+            return False
+
+        # Điều kiện 1: reason không được rỗng
+        if not record.get("reason"):
+            return False
+
+        # Điều kiện 2: prev_hash phải khớp với hash dòng trước
+        if record.get("prev_hash") != expected_prev:
+            return False
+
+        # Điều kiện 3: hash lưu trữ phải khớp với hash tính toán lại
+        stored_hash = record.get("hash")
+        computed_hash = _compute_hash(record)
+        if stored_hash != computed_hash:
+            return False
+
+        expected_prev = stored_hash
+
+    return True
+

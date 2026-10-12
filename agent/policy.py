@@ -35,6 +35,12 @@ không phải xác thực người dùng production.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+PRINCIPALS_PATH = DATA_DIR / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -51,5 +57,65 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def _load_principals() -> dict[str, dict]:
+    """Đọc cấu hình phân quyền mô phỏng từ data/principals.json."""
+    if not PRINCIPALS_PATH.exists():
+        return {}
+    return json.loads(PRINCIPALS_PATH.read_text(encoding="utf-8"))
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Policy Enforcement Point (PEP): Kiểm tra chính sách và phân quyền OBO."""
+
+    # 1. Rule TỐI THIỂU: Dữ liệu restricted đi kèm egress -> DENY tuyệt đối
+    if context.data_classification == "restricted" and context.egress_enabled is True:
+        return False, "deny: egress_enabled is True for restricted data classification"
+
+    # 2. Kiểm tra thời hạn hiệu lực (expires_at)
+    if context.expires_at:
+        try:
+            exp = datetime.fromisoformat(context.expires_at)
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp <= datetime.now(timezone.utc):
+                return False, f"deny: delegation token expired at {context.expires_at}"
+        except Exception:
+            return False, f"deny: invalid expires_at format '{context.expires_at}'"
+
+    # 3. Kiểm tra danh tính Principal (On-Behalf-Of)
+    if not context.principal_id:
+        return False, "deny: principal_id is required"
+
+    principals = _load_principals()
+    if context.principal_id not in principals:
+        return False, f"deny: unknown principal '{context.principal_id}'"
+
+    principal_data = principals[context.principal_id]
+
+    # Kiểm tra mục đích sử dụng (purpose)
+    allowed_purposes = principal_data.get("purposes", [])
+    if context.request_purpose and allowed_purposes and context.request_purpose not in allowed_purposes:
+        return False, f"deny: purpose '{context.request_purpose}' not permitted for principal '{context.principal_id}'"
+
+    # 4. Tính quyền hiệu lực (giao các tập scopes)
+    effective_tools = set(principal_data.get("allowed_tools", []))
+    if context.agent_scopes:
+        effective_tools = effective_tools.intersection(context.agent_scopes)
+
+    # Nếu ủy quyền qua nhiều tầng (delegation_depth > 0), không được mở rộng quyền ngoài parent_scopes
+    if context.delegation_depth > 0:
+        effective_tools = effective_tools.intersection(context.parent_scopes)
+
+    # 5. Kiểm tra quyền của tool được gọi
+    if context.requested_tool:
+        if context.requested_tool not in effective_tools:
+            return False, (
+                f"deny: tool '{context.requested_tool}' not in effective tools "
+                f"{sorted(effective_tools)} for principal '{context.principal_id}'"
+            )
+
+    return True, (
+        f"allow: tool '{context.requested_tool}' permitted for principal "
+        f"'{context.principal_id}' with purpose '{context.request_purpose}'"
+    )
+

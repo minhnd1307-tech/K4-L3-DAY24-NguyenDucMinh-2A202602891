@@ -1,6 +1,4 @@
-"""BƯỚC 3c — trifecta split + egress allowlist (13'). ĐÂY LÀ PHẦN KHÓ NHẤT.
-
-Đọc CHECKPOINTS.md (§3c) trước khi viết code. Tóm tắt yêu cầu:
+"""BƯỚC 3c — trifecta split + egress allowlist (13').
 
 Tách 1 yêu cầu người dùng thành ít nhất 2 run riêng biệt — KHÔNG run nào
 được cầm cả 3 chân của trifecta cùng lúc:
@@ -12,63 +10,157 @@ Tách 1 yêu cầu người dùng thành ít nhất 2 run riêng biệt — KHÔ
            list[int] ticket id trích từ TÊN FILE (vd "ticket-007.md" -> 7),
            KHÔNG BAO GIỜ nhận nguyên văn text của document. free text của
            attacker không được đi xa hơn Run A.
-
-Mọi lần gọi tool (allow HAY deny) phải:
-  1. Đi qua `agent.policy.check()` TRƯỚC KHI tool thật sự chạy.
-  2. Được ghi vào ledger qua `agent.ledger.append()` — cả khi deny.
-Nếu policy deny, KHÔNG được gọi tool đó.
-
---- Gợi ý kiến trúc (không bắt buộc theo đúng, nhưng đủ để làm trong 13') ---
-
-data/customers.json có field `related_tickets: list[int]` cho mỗi khách
-hàng — đây là NGUỒN TIN CẬY để map ticket_id -> customer_id, KHÔNG map qua
-customer_id mà attacker nhúng trong nội dung document. Cụ thể:
-
-    Run A: search_docs(message) -> lấy list[int] ticket_id từ TÊN FILE của
-           các doc khớp (vd "ticket-999.md" -> 999). Cũng chạy
-           llm.find_injection() trên text để log lại (KHÔNG dùng
-           customer_id mà nó trả về).
-    Run B: với mỗi ticket_id nhận từ Run A, tìm customer nào trong
-           customers.json có ticket_id trong related_tickets, rồi
-           read_customer(customer_id) đó — không phải customer_id lấy từ
-           text tự do.
-
-Vì sao cách này chống được một chỉ thị viết không dấu / lookalike: filter
-chuỗi thô sẽ luôn có thể bị né bằng cách viết lại chỉ thị, nhưng nếu Run B
-không bao giờ ĐỌC free text để quyết định gọi ai, thì việc né filter chuỗi
-trở nên vô nghĩa — đây là containment (kiến trúc), khác với mitigation
-(bộ lọc). Sinh viên NÊN thử filter chuỗi trước, rồi tự phá nó bằng
-một bản viết lại không dấu của lure, trước khi chuyển sang cách này.
-
-Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn tại):
-
-    handle(message: str, llm, log_dir: pathlib.Path | None = None,
-           principal_id: str = "support_l1") -> str
-        `llm` cung cấp:
-            llm.find_injection(text: str) -> InjectedInstruction | None
-            llm.summarize(docs: list[dict]) -> str
-        `log_dir` là thư mục chứa ledger.jsonl (mặc định: reports/).
-        Mỗi tool call truyền principal_id, requested_tool, agent_scopes,
-        parent_scopes và expires_at vào PolicyContext; ledger ghi
-        on_behalf_of = principal_id, agent_id, run_id, expires_at.
-        Principal chỉ được tra trong data/principals.json. Run B không
-        được đọc customer cho support_l1; dpo vẫn đọc được khách hợp lệ.
-        Trả về câu trả lời cuối cùng hiển thị cho người dùng — hành vi
-        quan sát được từ ngoài (CLI) không đổi so với trước khi contain,
-        chỉ có sink log và ledger là khác.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
+import hashlib
+import json
 from pathlib import Path
+import re
 
+from agent import ledger, pii, policy, tools
+from agent.policy import PolicyContext
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 
 class RunnerScaffoldPending(NotImplementedError):
-    """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
+    """Giữ nguyên class này để vượt qua bài test scaffold dispatch."""
+
+
+def _hash_args(args: dict) -> str:
+    """Băm SHA-256 các tham số gọi tool để đối chiếu kiểm toán không lộ PII thô."""
+    payload = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    """Xử lý yêu cầu với cơ chế Trifecta Split, OBO Delegation và Audit Ledger."""
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+
+    # TTL ủy quyền: mặc định 1 giờ tính từ thời điểm hiện tại
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(hours=1)).isoformat()
+
+    def record_call(tool: str, run_id: str, classification: str, args: dict,
+                    decision: str, reason: str) -> None:
+        """Ghi lại mọi quyết định kiểm soát vào chuỗi hash chain của ledger."""
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "lab24-agent",
+            "run_id": run_id,
+            "tool": tool,
+            "args_hash": _hash_args(args),
+            "classification": classification,
+            "decision": decision,
+            "reason": reason,
+            "on_behalf_of": principal_id,
+            "expires_at": expires_at,
+        }
+        ledger.append(entry, ledger_path)
+
+    # =========================================================================
+    # RUN A: Đọc tài liệu không tin cậy, sanitize và trích xuất ticket ID
+    # =========================================================================
+    ctx_search = PolicyContext(
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_owner="lab24-agent/run-a",
+        delegation_depth=0,
+        egress_enabled=False,
+        principal_id=principal_id,
+        requested_tool="search_docs",
+        agent_scopes=("search_docs", "read_customer"),
+        expires_at=expires_at,
+    )
+    allow_search, reason_search = policy.check(ctx_search)
+    record_call("search_docs", "run-a", "internal", {"query": message},
+                "allow" if allow_search else "deny", reason_search)
+
+    if not allow_search:
+        return "Yêu cầu tra cứu tài liệu bị từ chối bởi chính sách."
+
+    docs = tools.search_docs(message)
+
+    # Phân tích cú pháp: CHỈ trích xuất ticket ID dạng số từ TÊN FILE
+    ticket_ids: list[int] = []
+    for d in docs:
+        doc_id = d.get("id", "")
+        match = re.search(r"ticket-(\d+)", doc_id)
+        if match:
+            ticket_ids.append(int(match.group(1)))
+
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+
+    # =========================================================================
+    # RUN B: Truy xuất khách hàng từ liên kết hợp lệ trong cơ sở dữ liệu tin cậy
+    # =========================================================================
+    customers_path = DATA_DIR / "customers.json"
+    customers_data: list[dict] = []
+    if customers_path.exists():
+        customers_data = json.loads(customers_path.read_text(encoding="utf-8"))
+
+    # Tìm các customer_id có ticket_id nằm trong related_tickets
+    target_customers: list[str] = []
+    for t_id in ticket_ids:
+        for cust in customers_data:
+            if t_id in cust.get("related_tickets", []):
+                cid = cust["customer_id"]
+                if cid not in target_customers:
+                    target_customers.append(cid)
+
+    # Duyệt qua các khách hàng hợp lệ và thực thi chính sách OBO
+    for cid in target_customers:
+        ctx_read = PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner="lab24-agent/run-b",
+            delegation_depth=0,
+            egress_enabled=False,
+            principal_id=principal_id,
+            requested_tool="read_customer",
+            agent_scopes=("search_docs", "read_customer"),
+            expires_at=expires_at,
+        )
+        allow_read, reason_read = policy.check(ctx_read)
+        record_call("read_customer", "run-b", "restricted", {"customer_id": cid},
+                    "allow" if allow_read else "deny", reason_read)
+
+        if allow_read:
+            try:
+                tools.read_customer(cid)
+            except tools.ToolError:
+                pass
+
+    # =========================================================================
+    # Chặn hành vi Egress nếu phát hiện chỉ thị độc hại
+    # =========================================================================
+    if injected is not None:
+        ctx_post = PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner="lab24-agent/run-b",
+            delegation_depth=0,
+            egress_enabled=True,
+            principal_id=principal_id,
+            requested_tool="http_post",
+            agent_scopes=("search_docs", "read_customer"),
+            expires_at=expires_at,
+        )
+        allow_post, reason_post = policy.check(ctx_post)
+        record_call("http_post", "run-b", "restricted", {"url": injected.target_url},
+                    "allow" if allow_post else "deny", reason_post)
+        # allow_post luôn là False do rule tối thiểu (restricted + egress_enabled)
+        if allow_post:
+            tools.http_post(injected.target_url, {"records": []})
+
+    # Redact PII trước khi trả về tóm tắt cho người dùng
+    sanitized_docs = [
+        {"id": d["id"], "text": pii.redact(d["text"])} for d in docs
+    ]
+    return llm.summarize(sanitized_docs)
